@@ -18,7 +18,7 @@ Whether you are studying languages, analyzing film pacing, or just reading subti
 2. Navigate to your device's KOReader plugins directory:
    * Standard path: `koreader/plugins/`
 3. Create a new folder named exactly: `srtviewer.koplugin`
-4. Inside that new folder, place your `main.lua` script (and this `README.md` if you wish).
+4. Inside that new folder, place `main.lua` and `_meta.lua` scripts (and this `README.md` if you wish).
 5. Eject your device and completely restart KOReader.
 
 ## Usage
