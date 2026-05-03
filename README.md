@@ -34,7 +34,8 @@ Whether you are studying languages, analyzing film pacing, or just reading subti
 * **No Audio/Video:** This is purely a text parser and timer. It does not play media files.
 * **HTML Tags:** Currently, the parser reads raw text. If your `.srt` file contains heavy HTML formatting (like `<i>` or `<b>` tags), those tags will be displayed as raw text on the screen.
 * **File Encoding:** Ensure your `.srt` files are saved with UTF-8 encoding so special characters and non-English languages render correctly using KOReader's native fonts.
-
+* **Backlight:** Screen needs to be tapped once in a while to be keep backlight lit.
+  
 ## Changelog
 
 * **v1.0.0** - Initial release featuring smart parsing, e-ink optimized playback, progress saving, and rotation support.
