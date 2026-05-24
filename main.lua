@@ -22,6 +22,7 @@ local LuaSettings = require("luasettings")
 local DataStorage = require("datastorage")
 local _ = require("gettext")
 local logger = require("logger")
+local socket = require("socket")
 
 -- --- SRT Parsing Utilities ---
 
@@ -86,6 +87,8 @@ local SrtPlayerScreen = InputContainer:extend{
     is_playing = false,
     play_task = nil,
     current_time = 0,
+    playback_start_real_time = 0, -- Tracks actual wall-clock start
+    playback_start_sub_time = 0,  -- Tracks current_time at the moment playback started
     last_time_str = "",
     last_sub_text = "",
     filepath = nil,
@@ -97,7 +100,7 @@ function SrtPlayerScreen:init()
     local Screen = Device.screen
     self.dimen = Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight() }
     self.covers_fullscreen = true
-    
+
     if Device:hasKeys() then
         self.key_events.Close = { { Device.input.group.Back } }
     end
@@ -105,14 +108,12 @@ function SrtPlayerScreen:init()
     self:buildUI()
 end
 
--- A dedicated function to tear down and rebuild the screen to enforce geometry
 function SrtPlayerScreen:buildUI()
     local Screen = Device.screen
     local card_width = math.floor(Screen:getWidth() * 0.9)
-    local card_height = math.floor(Screen:getHeight() * 0.75) 
+    local card_height = math.floor(Screen:getHeight() * 0.75)
     local btn_w = math.floor(Screen:getWidth() * 0.18)
 
-    -- Capture the existing text if the UI is being rebuilt while playing
     local current_time_text = self.timestamp_widget and self.timestamp_widget.text or _("00:00:00 / 00:00:00")
     local current_sub_text = self.sub_widget and self.sub_widget.text or _("Load an SRT file to begin.")
 
@@ -134,7 +135,6 @@ function SrtPlayerScreen:buildUI()
         self.sub_widget,
     }
 
-    -- Set exact widths. The text swaps dynamically based on self.is_playing.
     self.play_button = Button:new{ text = self.is_playing and _("Pause") or _("Play"), callback = function() self:togglePlay() end, width = btn_w, bordersize = Size.border.window or 1 }
     self.seek_button = Button:new{ text = _("Seek"), callback = function() self:promptSeek() end, width = btn_w, bordersize = Size.border.window or 1 }
     self.rotate_button = Button:new{ text = _("Rotate"), callback = function() self:toggleRotation() end, width = btn_w, bordersize = Size.border.window or 1 }
@@ -153,9 +153,9 @@ function SrtPlayerScreen:buildUI()
 
     self.layout = VerticalGroup:new{
         align = "center",
-        self.timestamp_widget,
-        VerticalSpan:new{ width = 20 },
         card_container,
+        VerticalSpan:new{ width = 20 },
+        self.timestamp_widget,
         VerticalSpan:new{ width = 20 },
         control_row,
     }
@@ -179,7 +179,7 @@ end
 function SrtPlayerScreen:loadFile(filepath)
     self.filepath = filepath
     UIManager:show(InfoMessage:new{ text = _("Parsing SRT..."), timeout = 1 })
-    
+
     local ok, result = pcall(loadAndParseSRT, filepath)
     if not ok then
         self.sub_widget:setText(_("Crash during SRT parsing."))
@@ -188,7 +188,7 @@ function SrtPlayerScreen:loadFile(filepath)
     end
 
     self.subs = result
-    
+
     if not self.subs or #self.subs == 0 then
         self.sub_widget:setText(_("Error loading or parsing SRT file."))
         self:refresh()
@@ -200,7 +200,7 @@ function SrtPlayerScreen:loadFile(filepath)
 
     self.current_time = saved_time
     self.current_index = 1
-    
+
     for i, sub in ipairs(self.subs) do
         if sub.end_time > saved_time then
             self.current_index = i
@@ -208,18 +208,18 @@ function SrtPlayerScreen:loadFile(filepath)
         end
     end
 
-    self:updateDisplay(true) 
+    self:updateDisplay(true)
 end
 
 function SrtPlayerScreen:updateDisplay(force)
     if not self.subs or #self.subs == 0 then return end
-    
+
     local total_time = self.subs[#self.subs].end_time
     local new_time_str = formatSrtTime(self.current_time) .. " / " .. formatSrtTime(total_time)
-    
+
     local sub = self.subs[self.current_index]
     local new_text = ""
-    
+
     if sub and self.current_time >= sub.start_time and self.current_time < sub.end_time then
         new_text = sub.text
     end
@@ -245,11 +245,12 @@ end
 
 function SrtPlayerScreen:togglePlay()
     self.is_playing = not self.is_playing
-
-    -- Per your suggestion: completely rebuild the layout to lock the button padding!
     self:buildUI()
 
     if self.is_playing then
+        -- Anchor the timing to the system's high-precision clock
+        self.playback_start_real_time = socket.gettime()
+        self.playback_start_sub_time = self.current_time
         self:tick()
     else
         self:saveProgress()
@@ -263,7 +264,10 @@ end
 function SrtPlayerScreen:tick()
     if not self.is_playing then return end
 
-    self.current_time = self.current_time + 0.25
+    -- Calculate exact elapsed time rather than assuming 0.25s per loop
+    local now = socket.gettime()
+    local elapsed = now - self.playback_start_real_time
+    self.current_time = self.playback_start_sub_time + elapsed
 
     while self.current_index <= #self.subs and self.subs[self.current_index].end_time <= self.current_time do
         self.current_index = self.current_index + 1
@@ -306,7 +310,7 @@ function SrtPlayerScreen:promptSeek()
                     callback = function()
                         local input = dialog:getInputText()
                         local target_sec = 0
-                        
+
                         local h, m, s = input:match("(%d+)[:%.](%d+)[:%.](%d+)")
                         if h and m and s then
                             target_sec = (tonumber(h) or 0) * 3600 + (tonumber(m) or 0) * 60 + (tonumber(s) or 0)
@@ -318,7 +322,7 @@ function SrtPlayerScreen:promptSeek()
                                 target_sec = tonumber(input) or 0
                             end
                         end
-                        
+
                         self:jumpToTime(target_sec)
                         self:saveProgress()
                         UIManager:close(dialog)
@@ -334,9 +338,17 @@ end
 
 function SrtPlayerScreen:jumpToTime(seconds)
     if not self.subs or #self.subs == 0 then return end
-    self.current_time = seconds
-    self.current_index = 1
     
+    self.current_time = seconds
+    
+    -- If playing, re-anchor the start times so playback accurately continues from the seeked point
+    if self.is_playing then
+        self.playback_start_real_time = socket.gettime()
+        self.playback_start_sub_time = self.current_time
+    end
+
+    self.current_index = 1
+
     for i, sub in ipairs(self.subs) do
         if sub.end_time > seconds then
             self.current_index = i
@@ -359,10 +371,10 @@ function SrtPlayerScreen:toggleRotation()
     local current_mode = Screen:getRotationMode()
     local new_mode = (current_mode + 1) % 4
     Screen:setRotationMode(new_mode)
-    
+
     UIManager:close(self)
     UIManager:setDirty(nil, "full")
-    
+
     UIManager:scheduleIn(0.05, function()
         local new_screen = SrtPlayerScreen:new{ plugin = active_plugin }
         UIManager:show(new_screen)
@@ -392,13 +404,18 @@ function SrtPlayerScreen:onClose()
     UIManager:setDirty(nil, "full")
 end
 
+function SrtPlayerScreen:onSuspend()
+    if self.is_playing then self:togglePlay() end
+    self:saveProgress()
+end
+
 -- --- Main Plugin Container ---
 
 local SrtViewer = WidgetContainer:extend{ name = "srtviewer" }
 
 function SrtViewer:init()
     self.ui.menu:registerToMainMenu(self)
-    
+
     self.settings_file = DataStorage:getSettingsDir() .. "/srtviewer.lua"
     self.settings = LuaSettings:open(self.settings_file)
 end
@@ -450,5 +467,7 @@ function SrtViewer:showPlayer(filepath)
     UIManager:show(screen)
     screen:loadFile(filepath)
 end
+
+
 
 return SrtViewer
