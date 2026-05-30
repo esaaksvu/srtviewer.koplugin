@@ -20,6 +20,7 @@ local ConfirmBox = require("ui/widget/confirmbox")
 local PathChooser = require("ui/widget/pathchooser")
 local LuaSettings = require("luasettings")
 local DataStorage = require("datastorage")
+local Event = require("ui/event")
 local _ = require("gettext")
 local logger = require("logger")
 local socket = require("socket")
@@ -87,19 +88,28 @@ local SrtPlayerScreen = InputContainer:extend{
     is_playing = false,
     play_task = nil,
     current_time = 0,
-    playback_start_real_time = 0, -- Tracks actual wall-clock start
-    playback_start_sub_time = 0,  -- Tracks current_time at the moment playback started
+    playback_start_real_time = 0,
+    playback_start_sub_time = 0,
     last_time_str = "",
     last_sub_text = "",
     filepath = nil,
     plugin = nil,
     key_events = {},
+    
+    -- Sleep & Inactivity properties
+    inactivity_timeout = 2700, -- 45 minutes in seconds
+    last_interaction_time = 0,
+    last_ping_time = 0,
 }
 
 function SrtPlayerScreen:init()
     local Screen = Device.screen
     self.dimen = Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight() }
     self.covers_fullscreen = true
+    self.last_interaction_time = socket.gettime()
+
+    local saved_timeout = self.plugin.settings:readSetting("inactivity_timeout")
+    self.inactivity_timeout = (saved_timeout ~= nil) and saved_timeout or 2700
 
     if Device:hasKeys() then
         self.key_events.Close = { { Device.input.group.Back } }
@@ -111,16 +121,14 @@ end
 function SrtPlayerScreen:buildUI()
     local Screen = Device.screen
     local card_width = math.floor(Screen:getWidth() * 0.9)
-    local card_height = math.floor(Screen:getHeight() * 0.75)
-    local btn_w = math.floor(Screen:getWidth() * 0.18)
+    local card_height = math.floor(Screen:getHeight() * 0.65) 
+    
+    -- Two different button widths so they fill the screen nicely
+    local btn_w_3 = math.floor(Screen:getWidth() * 0.26) -- For the 3-button row
+    local btn_w_4 = math.floor(Screen:getWidth() * 0.20) -- For the 4-button row
 
     local current_time_text = self.timestamp_widget and self.timestamp_widget.text or _("00:00:00 / 00:00:00")
     local current_sub_text = self.sub_widget and self.sub_widget.text or _("Load an SRT file to begin.")
-
-    self.timestamp_widget = TextWidget:new{
-        face = Font:getFace("cfont", 26),
-        text = current_time_text,
-    }
 
     self.sub_widget = TextBoxWidget:new{
         face = Font:getFace("cfont", 34),
@@ -135,29 +143,53 @@ function SrtPlayerScreen:buildUI()
         self.sub_widget,
     }
 
-    self.play_button = Button:new{ text = self.is_playing and _("Pause") or _("Play"), callback = function() self:togglePlay() end, width = btn_w, bordersize = Size.border.window or 1 }
-    self.seek_button = Button:new{ text = _("Seek"), callback = function() self:promptSeek() end, width = btn_w, bordersize = Size.border.window or 1 }
-    self.rotate_button = Button:new{ text = _("Rotate"), callback = function() self:toggleRotation() end, width = btn_w, bordersize = Size.border.window or 1 }
-    self.close_button = Button:new{ text = _("Close"), callback = function() self:onClose() end, width = btn_w, bordersize = Size.border.window or 1 }
+    -- Row 1: Timestamp (Centered text on its own row)
+    self.timestamp_widget = TextWidget:new{
+        face = Font:getFace("cfont", 26),
+        text = current_time_text,
+    }
 
-    local control_row = HorizontalGroup:new{
+    -- Row 2: Time Controls [-10s] [Play/Pause] [+10s]
+    self.rw_button = Button:new{ text = _("-10s"), callback = function() self.last_interaction_time = socket.gettime(); self:skipTime(-10) end, width = btn_w_3, bordersize = Size.border.window or 1 }
+    self.play_button = Button:new{ text = self.is_playing and _("Pause") or _("Play"), callback = function() self:togglePlay() end, width = btn_w_3, bordersize = Size.border.window or 1 }
+    self.ff_button = Button:new{ text = _("+10s"), callback = function() self.last_interaction_time = socket.gettime(); self:skipTime(10) end, width = btn_w_3, bordersize = Size.border.window or 1 }
+
+    local row_2_time_controls = HorizontalGroup:new{
         align = "center",
+        self.rw_button,
+        HorizontalSpan:new{ width = 15 },
         self.play_button,
         HorizontalSpan:new{ width = 15 },
+        self.ff_button,
+    }
+
+    -- Row 3: Main Actions [Seek] [Timer] [Rotate] [Close]
+    self.seek_button = Button:new{ text = _("Seek"), callback = function() self:promptSeek() end, width = btn_w_4, bordersize = Size.border.window or 1 }
+    self.timer_button = Button:new{ text = _("Timer"), callback = function() self:promptTimer() end, width = btn_w_4, bordersize = Size.border.window or 1 }
+    self.rotate_button = Button:new{ text = _("Rotate"), callback = function() self:toggleRotation() end, width = btn_w_4, bordersize = Size.border.window or 1 }
+    self.close_button = Button:new{ text = _("Close"), callback = function() self:onClose() end, width = btn_w_4, bordersize = Size.border.window or 1 }
+
+    local row_3_main_controls = HorizontalGroup:new{
+        align = "center",
         self.seek_button,
-        HorizontalSpan:new{ width = 15 },
+        HorizontalSpan:new{ width = 10 },
+        self.timer_button,
+        HorizontalSpan:new{ width = 10 },
         self.rotate_button,
-        HorizontalSpan:new{ width = 15 },
+        HorizontalSpan:new{ width = 10 },
         self.close_button,
     }
 
+    -- Main Layout Assembly
     self.layout = VerticalGroup:new{
         align = "center",
         card_container,
-        VerticalSpan:new{ width = 20 },
+        VerticalSpan:new{ width = 15 },
         self.timestamp_widget,
-        VerticalSpan:new{ width = 20 },
-        control_row,
+        VerticalSpan:new{ width = 15 },
+        row_2_time_controls,
+        VerticalSpan:new{ width = 15 },
+        row_3_main_controls,
     }
 
     self[1] = CenterContainer:new{
@@ -243,12 +275,66 @@ function SrtPlayerScreen:updateDisplay(force)
     end
 end
 
+function SrtPlayerScreen:promptTimer()
+    self.last_interaction_time = socket.gettime()
+    local was_playing = self.is_playing
+    if was_playing then self:togglePlay() end
+
+    -- Convert current timeout from seconds to minutes for the UI
+    local current_mins = math.floor(self.inactivity_timeout / 60)
+
+    local dialog
+    dialog = InputDialog:new{
+        title = _("Inactivity Timer (minutes, 0 to disable)"),
+        input = tostring(current_mins),
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        if was_playing then self:togglePlay() end
+                    end,
+                },
+                {
+                    text = _("Save"),
+                    is_enter_default = true,
+                    callback = function()
+                        local input = dialog:getInputText()
+                        local mins = tonumber(input)
+                        
+                        if mins then
+                            -- Ensure it's not a negative number
+                            mins = math.max(0, mins)
+                            self.inactivity_timeout = mins * 60
+                            
+                            -- Save permanently to plugin settings
+                            self.plugin.settings:saveSetting("inactivity_timeout", self.inactivity_timeout)
+                            self.plugin.settings:flush()
+                            
+                            UIManager:show(InfoMessage:new{
+                                text = mins == 0 and _("Sleep timer disabled") or string.format(_("Timer set to %d minutes"), mins),
+                                timeout = 3
+                            })
+                        end
+                        
+                        UIManager:close(dialog)
+                        if was_playing then self:togglePlay() end
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
 function SrtPlayerScreen:togglePlay()
+    self.last_interaction_time = socket.gettime()
     self.is_playing = not self.is_playing
     self:buildUI()
 
     if self.is_playing then
-        -- Anchor the timing to the system's high-precision clock
         self.playback_start_real_time = socket.gettime()
         self.playback_start_sub_time = self.current_time
         self:tick()
@@ -264,8 +350,26 @@ end
 function SrtPlayerScreen:tick()
     if not self.is_playing then return end
 
-    -- Calculate exact elapsed time rather than assuming 0.25s per loop
     local now = socket.gettime()
+    
+    -- Inactivity Kill-Switch (0 means disabled)
+    if self.inactivity_timeout > 0 and (now - self.last_interaction_time) > self.inactivity_timeout then
+        logger.info("SRTViewer: Inactivity timeout reached. Pausing playback.")
+        UIManager:show(InfoMessage:new{ 
+            text = _("Playback paused due to inactivity."), 
+            timeout = 3 
+        })
+        self:togglePlay() 
+        return
+    end
+
+    -- Keep-alive ping (resets device sleep timer every 30 seconds)
+    if not self.last_ping_time or (now - self.last_ping_time) > 30 then
+        logger.info("SRTViewer: Sending keep-alive ping.")
+        UIManager:broadcastEvent(Event:new("UserActivity")) 
+        self.last_ping_time = now
+    end
+
     local elapsed = now - self.playback_start_real_time
     self.current_time = self.playback_start_sub_time + elapsed
 
@@ -276,7 +380,7 @@ function SrtPlayerScreen:tick()
     if self.current_index > #self.subs then
         self.current_time = self.subs[#self.subs].end_time
         self:updateDisplay(true)
-        self:togglePlay()
+        if self.is_playing then self:togglePlay() end
         return
     end
 
@@ -288,6 +392,7 @@ function SrtPlayerScreen:tick()
 end
 
 function SrtPlayerScreen:promptSeek()
+    self.last_interaction_time = socket.gettime()
     local was_playing = self.is_playing
     if was_playing then self:togglePlay() end
 
@@ -336,12 +441,26 @@ function SrtPlayerScreen:promptSeek()
     dialog:onShowKeyboard()
 end
 
+function SrtPlayerScreen:skipTime(seconds)
+    if not self.subs or #self.subs == 0 then return end
+    
+    local target_time = self.current_time + seconds
+    local total_time = self.subs[#self.subs].end_time
+    
+    if target_time < 0 then 
+        target_time = 0 
+    elseif target_time > total_time then 
+        target_time = total_time 
+    end
+
+    self:jumpToTime(target_time)
+end
+
 function SrtPlayerScreen:jumpToTime(seconds)
     if not self.subs or #self.subs == 0 then return end
     
     self.current_time = seconds
     
-    -- If playing, re-anchor the start times so playback accurately continues from the seeked point
     if self.is_playing then
         self.playback_start_real_time = socket.gettime()
         self.playback_start_sub_time = self.current_time
@@ -359,6 +478,7 @@ function SrtPlayerScreen:jumpToTime(seconds)
 end
 
 function SrtPlayerScreen:toggleRotation()
+    self.last_interaction_time = socket.gettime()
     local was_playing = self.is_playing
     if was_playing then self:togglePlay() end
     self:saveProgress()
@@ -370,7 +490,9 @@ function SrtPlayerScreen:toggleRotation()
     local Screen = Device.screen
     local current_mode = Screen:getRotationMode()
     local new_mode = (current_mode + 1) % 4
-    Screen:setRotationMode(new_mode)
+    
+    -- Let KOReader's global event system handle the rotation safely
+    UIManager:broadcastEvent(Event:new("SetRotationMode", new_mode))
 
     UIManager:close(self)
     UIManager:setDirty(nil, "full")
@@ -382,6 +504,12 @@ function SrtPlayerScreen:toggleRotation()
         new_screen:jumpToTime(target_time)
         if was_playing then new_screen:togglePlay() end
     end)
+end
+
+function SrtPlayerScreen:onTap(tap)
+    -- Reset timeout if the user randomly taps the screen
+    self.last_interaction_time = socket.gettime()
+    return true
 end
 
 function SrtPlayerScreen:paintTo(bb, x, y)
@@ -407,6 +535,11 @@ end
 function SrtPlayerScreen:onSuspend()
     if self.is_playing then self:togglePlay() end
     self:saveProgress()
+end
+
+function SrtPlayerScreen:onResume()
+    -- Force full e-ink screen refresh after waking up
+    UIManager:setDirty(nil, "full")
 end
 
 -- --- Main Plugin Container ---
@@ -467,7 +600,5 @@ function SrtViewer:showPlayer(filepath)
     UIManager:show(screen)
     screen:loadFile(filepath)
 end
-
-
 
 return SrtViewer
